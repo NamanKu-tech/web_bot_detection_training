@@ -2,3 +2,7 @@ web_bot_detection_dataset/
 *.json
 *.ipynb_checkpoints/
 __pycache__/
+*.csv
+*.txt
+*.xml
+.venv

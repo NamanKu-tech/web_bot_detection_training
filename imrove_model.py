@@ -1,7 +1,6 @@
 import os
 import json
 import numpy as np
-import pandas as pd
 import joblib
 
 from xgboost import XGBClassifier
@@ -9,23 +8,17 @@ from sklearn.model_selection import train_test_split
 from sklearn.metrics import roc_auc_score, accuracy_score, confusion_matrix
 
 
-# -------------------------------------------------------------------
-# 0. Feature extraction and trace loader (with NaN/Inf protection)
-# -------------------------------------------------------------------
+# ================================================================
+# 1. Feature Extraction (compute dt, but only use non-dt features)
+# ================================================================
 
 def extract_features(times, xs_norm, ys_norm):
     times = np.array(times, dtype=float)
     xs = np.array(xs_norm, dtype=float)
     ys = np.array(ys_norm, dtype=float)
 
-    n_points = len(xs)
-    if n_points == 0 or len(times) == 0:
-        # completely empty trace, all zeros
+    if len(xs) < 2 or len(times) < 2:
         return {
-            "duration": 0.0,
-            "path_length": 0.0,
-            "displacement": 0.0,
-            "straightness": 0.0,
             "jitter_index": 0.0,
             "speed_mean": 0.0,
             "speed_std": 0.0,
@@ -40,35 +33,24 @@ def extract_features(times, xs_norm, ys_norm):
             "dt_std": 0.0,
             "dt_max": 0.0,
             "curvature": 0.0,
-            "n_points": 0,
         }
 
-    # basic stats
-    duration = times[-1] - times[0] if n_points > 1 else 0.0
+    # dt
+    dts = np.diff(times)
+    dts[dts <= 0] = 1e-6
+    dt_mean = dts.mean()
+    dt_std = dts.std()
+    dt_max = dts.max()
 
-    # path length
+    # distance
     dx = np.diff(xs)
     dy = np.diff(ys)
     dist = np.sqrt(dx * dx + dy * dy)
-    path_length = dist.sum()
 
-    # net displacement
-    displacement = np.sqrt((xs[-1] - xs[0]) ** 2 + (ys[-1] - ys[0]) ** 2)
-    straightness = displacement / path_length if path_length > 0 else 0.0
-
-    # dt features
-    dts = np.diff(times)
-    dt_mean = dts.mean() if len(dts) else 0.0
-    dt_std = dts.std() if len(dts) else 0.0
-    dt_max = dts.max() if len(dts) else 0.0
-
-    # speeds (protect against division by zero -> Inf/NaN)
-    if len(dist) and len(dts):
-        with np.errstate(divide="ignore", invalid="ignore"):
-            speeds = dist / dts
-        speeds[~np.isfinite(speeds)] = 0.0
-    else:
-        speeds = np.array([0.0])
+    # speed
+    with np.errstate(divide="ignore", invalid="ignore"):
+        speeds = dist / dts
+    speeds[~np.isfinite(speeds)] = 0.0
 
     speed_mean = speeds.mean()
     speed_std = speeds.std()
@@ -88,13 +70,13 @@ def extract_features(times, xs_norm, ys_norm):
     jerk_std = jerk.std()
     jerk_max = jerk.max()
 
-    # jitter index
+    # jitter
     if len(xs) > 2:
         jitter = np.abs(np.diff(xs, 2)).sum() + np.abs(np.diff(ys, 2)).sum()
     else:
         jitter = 0.0
 
-    # curvature approximation
+    # curvature
     curvature = 0.0
     if len(xs) > 2:
         for i in range(1, len(xs) - 1):
@@ -105,14 +87,9 @@ def extract_features(times, xs_norm, ys_norm):
             if n1 > 1e-6 and n2 > 1e-6:
                 dot = np.dot(v1, v2) / (n1 * n2)
                 dot = np.clip(dot, -1.0, 1.0)
-                angle = np.arccos(dot)
-                curvature += angle
+                curvature += np.arccos(dot)
 
     return {
-        "duration": float(duration),
-        "path_length": float(path_length),
-        "displacement": float(displacement),
-        "straightness": float(straightness),
         "jitter_index": float(jitter),
         "speed_mean": float(speed_mean),
         "speed_std": float(speed_std),
@@ -127,225 +104,166 @@ def extract_features(times, xs_norm, ys_norm):
         "dt_std": float(dt_std),
         "dt_max": float(dt_max),
         "curvature": float(curvature),
-        "n_points": int(n_points),
     }
 
 
+# ================================================================
+# 2. Trace Loader
+# ================================================================
+
 def load_mouse_trace(path):
-    times = []
-    xs = []
-    ys = []
-    viewport_w = viewport_h = None
+    times, xs, ys = [], [], []
+    vw = vh = None
 
     with open(path, "r") as f:
         for line in f:
             line = line.strip()
-
-            # resolution line
             if line.startswith("resolution:"):
-                _, res = line.split(":")
-                w, h = res.split(",")
-                viewport_w = float(w)
-                viewport_h = float(h)
+                _, r = line.split(":")
+                vw, vh = map(float, r.split(","))
                 continue
 
-            # event line: t,event,x,y
             parts = line.split(",")
             if len(parts) != 4:
                 continue
-
             t, event, x, y = parts
-            if event != "Move":   # ignore Pressed/Released
+            if event != "Move":
                 continue
 
             times.append(float(t))
             xs.append(float(x))
             ys.append(float(y))
 
-    if viewport_w is None:
-        raise ValueError(f"Resolution line missing in {path}")
+    if vw is None:
+        raise ValueError(f"Resolution missing in {path}")
 
-    return np.array(times), np.array(xs), np.array(ys), viewport_w, viewport_h
+    return np.array(times), np.array(xs), np.array(ys), vw, vh
 
 
-# -------------------------------------------------------------------
-# 1. Dataset construction from sessions.json
-# -------------------------------------------------------------------
+# ================================================================
+# 3. Dataset Builder (sessions.json → X, y)
+# ================================================================
 
-feature_cols = [
-    "duration", "path_length", "displacement", "straightness",
-    "jitter_index", "speed_mean", "speed_std", "speed_max",
-    "acc_mean", "acc_std", "acc_max",
-    "jerk_mean", "jerk_std", "jerk_max",
-    "dt_mean", "dt_std", "dt_max",
-    "curvature", "n_points"
+# FINAL 11 FEATURE SET (dt_* REMOVED)
+FEATURE_COLS = [
+    "jitter_index",
+    "speed_mean",
+    "speed_std",
+    "speed_max",
+    "acc_mean",
+    "acc_std",
+    "acc_max",
+    "jerk_mean",
+    "jerk_std",
+    "jerk_max",
+    "curvature",
 ]
 
 
 def resolve_path(base_dir, rel_or_abs):
-    """
-    Resolve paths listed in sessions.json.
-    If relative, resolve relative to the JSON directory.
-    """
     if os.path.isabs(rel_or_abs):
         return rel_or_abs
     return os.path.normpath(os.path.join(base_dir, rel_or_abs))
 
 
 def build_dataset_from_sessions(sessions_path):
-    """
-    Read sessions.json with structure something like:
-        {
-          "human": [... paths ...],
-          "bot":   [... paths ...]
-        }
-    and build X (features) and y (labels).
-    """
     with open(sessions_path, "r") as f:
         sessions = json.load(f)
 
-    base_dir = os.path.dirname(os.path.abspath(sessions_path))
+    base_dir = os.path.dirname(sessions_path)
+    rows, labels = [], []
 
-    rows = []
-    labels = []
-    file_list = []
-
-    # human → label 1
-    for rel_path in sessions.get("human", []):
-        full_path = resolve_path(base_dir, rel_path)
+    def process_file(fpath, label):
         try:
-            times, xs, ys, vw, vh = load_mouse_trace(full_path)
-
-            # skip traces with no or almost no movement
-            if len(times) < 2 or len(xs) < 2:
-                print(f"[SKIP HUMAN] {full_path} has insufficient movement data.")
-                continue
-
+            times, xs, ys, vw, vh = load_mouse_trace(fpath)
+            if len(times) < 3:
+                print(f"[SKIP] {fpath}: too few points")
+                return
             xs_norm = xs / vw
             ys_norm = ys / vh
             feats = extract_features(times, xs_norm, ys_norm)
-            row = [feats[c] for c in feature_cols]
-            rows.append(row)
-            labels.append(1)
-            file_list.append(full_path)
+            rows.append([feats[c] for c in FEATURE_COLS])
+            labels.append(label)
         except Exception as e:
-            print(f"[HUMAN] Error processing {full_path}: {e}")
+            print(f"[ERR] {fpath}: {e}")
 
-    # bot → label 0
-    for rel_path in sessions.get("bot", []):
-        full_path = resolve_path(base_dir, rel_path)
-        try:
-            times, xs, ys, vw, vh = load_mouse_trace(full_path)
+    for f in sessions.get("human", []):
+        process_file(resolve_path(base_dir, f), 1)
+    for f in sessions.get("bot", []):
+        process_file(resolve_path(base_dir, f), 0)
 
-            if len(times) < 2 or len(xs) < 2:
-                print(f"[SKIP BOT] {full_path} has insufficient movement data.")
-                continue
+    X = np.nan_to_num(np.array(rows), nan=0.0, posinf=0.0, neginf=0.0)
+    y = np.array(labels)
 
-            xs_norm = xs / vw
-            ys_norm = ys / vh
-            feats = extract_features(times, xs_norm, ys_norm)
-            row = [feats[c] for c in feature_cols]
-            rows.append(row)
-            labels.append(0)
-            file_list.append(full_path)
-        except Exception as e:
-            print(f"[BOT] Error processing {full_path}: {e}")
-
-    X = np.array(rows, dtype=float)
-    y = np.array(labels, dtype=int)
-
-    # final safety: remove NaN/Inf from features
-    X = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
-
-    print(
-        f"Built dataset from {len(file_list)} traces "
-        f"(humans={(y == 1).sum()}, bots={(y == 0).sum()})"
-    )
-
+    print(f"Dataset built: {len(y)} traces (humans={y.sum()}, bots={(y == 0).sum()})")
     return X, y
 
 
-# -------------------------------------------------------------------
-# 2. Training logic (rebuilds / improves your XGB model)
-# -------------------------------------------------------------------
+# ================================================================
+# 4. Train XGBoost using 11-feature dataset
+# ================================================================
 
 def main():
-    sessions_path = "sessions.json"   # adjust if needed
-
-    print("Loading dataset from sessions.json...")
-    X, y = build_dataset_from_sessions(sessions_path)
+    print("Loading dataset...")
+    X, y = build_dataset_from_sessions("sessions.json")
 
     X_train, X_val, y_train, y_val = train_test_split(
         X, y, test_size=0.2, random_state=42, stratify=y
     )
 
-    # Handle class imbalance
+    # class imbalance
     n_pos = (y_train == 1).sum()
     n_neg = (y_train == 0).sum()
-    scale_pos_weight = n_neg / n_pos if n_pos > 0 else 1.0
-    print(f"scale_pos_weight = {scale_pos_weight:.3f}")
+    scale_pos_weight = n_neg / max(n_pos, 1)
+    print(f"scale_pos_weight = {scale_pos_weight:.3f} (neg={n_neg}, pos={n_pos})")
 
-    # Try to reuse hyperparameters from existing pickle model, if present
-    existing_model_path = "mouse_model_xgb.pkl"
-    params = None
-    if os.path.exists(existing_model_path):
-        try:
-            old_model = joblib.load(existing_model_path)
-            params = old_model.get_params()
-            print("Loaded existing model; reusing its hyperparameters.")
-        except Exception as e:
-            print(f"Could not load existing model ({e}); using default params.")
+    model = XGBClassifier(
+        n_estimators=400,
+        max_depth=5,
+        learning_rate=0.05,
+        subsample=0.8,
+        colsample_bytree=0.8,
+        min_child_weight=5,
+        reg_lambda=1.0,
+        objective="binary:logistic",
+        eval_metric="logloss",
+        tree_method="hist",
+        n_jobs=-1,
+        random_state=42,
+        scale_pos_weight=scale_pos_weight,
+    )
 
-    if params is None:
-        params = dict(
-            n_estimators=500,
-            learning_rate=0.05,
-            max_depth=5,
-            subsample=0.8,
-            colsample_bytree=0.8,
-            min_child_weight=5,
-            reg_lambda=1.0,
-            objective="binary:logistic",
-            eval_metric="logloss",
-            n_jobs=-1,
-            tree_method="hist",  # change to "gpu_hist" if you use GPU
-            random_state=42,
-        )
-    else:
-        # ensure some important defaults if missing
-        params.setdefault("objective", "binary:logistic")
-        params.setdefault("eval_metric", "logloss")
-        params.setdefault("tree_method", "hist")
-
-    params["scale_pos_weight"] = scale_pos_weight
-
-    model = XGBClassifier(**params)
-
-    print("Training XGBoost model...")
+    print("Training XGB model (no dt features)...")
     model.fit(
         X_train,
         y_train,
         eval_set=[(X_val, y_val)],
+        early_stopping_rounds=50,
         verbose=50,
-        early_stopping_rounds=50,  # ok to keep; only raises a warning
     )
 
-    # Evaluation
-    y_val_prob = model.predict_proba(X_val)[:, 1]
-    y_val_pred = (y_val_prob >= 0.5).astype(int)
+    # Evaluate
+    probs = model.predict_proba(X_val)[:, 1]
+    preds = (probs >= 0.5).astype(int)
 
-    auc = roc_auc_score(y_val, y_val_prob)
-    acc = accuracy_score(y_val, y_val_pred)
-    cm = confusion_matrix(y_val, y_val_pred)
+    auc = roc_auc_score(y_val, probs)
+    acc = accuracy_score(y_val, preds)
+    cm = confusion_matrix(y_val, preds)
 
-    print(f"Validation AUC: {auc:.4f}")
-    print(f"Validation Accuracy: {acc:.4f}")
-    print("Confusion matrix [[TN FP],[FN TP]]:")
+    print(f"Validation AUC = {auc:.4f}")
+    print(f"Validation ACC = {acc:.4f}")
+    print("Confusion matrix:")
     print(cm)
 
-    # Save improved model (overwrites old pickle)
-    joblib.dump(model, existing_model_path)
-    print(f"Saved updated model to {existing_model_path}")
+    # Feature importance
+    print("\n=== FEATURE IMPORTANCE (11 features, no dt) ===")
+    for name, imp in sorted(zip(FEATURE_COLS, model.feature_importances_), key=lambda x: -x[1]):
+        print(f"{name:15s}: {imp:.5f}")
+
+    # Save model as _3
+    out_path = "mouse_model_xgb_3.pkl"
+    joblib.dump(model, out_path)
+    print(f"Saved model → {out_path}")
 
 
 if __name__ == "__main__":
